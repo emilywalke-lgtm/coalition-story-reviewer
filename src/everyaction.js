@@ -1,11 +1,9 @@
 /**
- * EveryAction API Client
+ * EveryAction API Client — uses ChangedEntityExportJobs
  *
- * Fetches story submissions from EveryAction's Story Collection forms.
- * These use EveryAction's dedicated Stories API — NOT survey question
- * responses — so no Survey Question ID is needed.
- *
- * Auth: Basic auth, username = "AppName|DbMode", password = API key
+ * The proper way to bulk-pull form submissions: create an export job
+ * for "ContactsOnlineForms" filtered by date range, poll until ready,
+ * then download the CSV.
  */
 
 const axios = require('axios');
@@ -14,142 +12,125 @@ class EveryActionClient {
   constructor({ appName, apiKey, dbMode = 1 }) {
     this.http = axios.create({
       baseURL: 'https://api.securevan.com/v4',
-      auth: {
-        username: `${appName}|${dbMode}`,
-        password: apiKey,
-      },
+      auth: { username: `${appName}|${dbMode}`, password: apiKey },
       headers: { 'Content-Type': 'application/json' },
-      timeout: 30000,
+      timeout: 60000,
     });
   }
 
   /**
-   * Get all contacts who had a specific activist code applied
-   * within the lookback window. Handles pagination automatically.
+   * Create a Changed Entity Export job for ContactsOnlineForms
+   * within the given date range.
    */
-  async getContactsWithActivistCode(activistCodeId, sinceDate) {
-    const contacts = [];
-    let skip = 0;
-    const top = 50;
-    const since = new Date(sinceDate);
+  async createExportJob(resourceType, sinceDate, requestedFields) {
+    const body = {
+      dateChangedFrom: sinceDate,
+      resourceType,
+      requestedFields,
+      fileSizeKbLimit: 50000,
+    };
 
-    console.log(`  Fetching contacts with activist code ${activistCodeId} since ${sinceDate}...`);
-
-    while (true) {
-      const response = await this.http.get('/people', {
-        params: { $top: top, $skip: skip, activistCodeId },
-      });
-
-      const items = response.data?.items || [];
-      if (items.length === 0) break;
-
-      // Filter to contacts modified within our lookback window
-      const recent = items.filter(c => {
-        const modified = new Date(c.dateModified || c.dateCreated || 0);
-        return modified >= since;
-      });
-
-      contacts.push(...recent);
-
-      if (items.length < top) break;
-
-      // If oldest item on this page is before our window, stop paginating
-      const oldest = new Date(items[items.length - 1]?.dateModified || 0);
-      if (oldest < since) break;
-
-      skip += top;
-    }
-
-    console.log(`  Found ${contacts.length} recent contacts.`);
-    return contacts;
+    const response = await this.http.post('/changedEntityExportJobs', body);
+    return response.data;
   }
 
   /**
-   * Get story submissions for a contact using EveryAction's Stories API.
-   * This is what Story Collection Forms use — separate from survey questions.
-   * Returns the most recent story's text, or null if none found.
+   * Poll until the export job is complete, then return its file URLs.
    */
-  async getStoryText(vanId) {
-    try {
-      const response = await this.http.get(`/people/${vanId}/stories`);
-      const stories = response.data?.items || response.data || [];
-
-      if (!stories.length) return null;
-
-      // Sort by date descending, return the most recent story's text
-      stories.sort((a, b) =>
-        new Date(b.dateModified || b.dateCreated || 0) -
-        new Date(a.dateModified || a.dateCreated || 0)
-      );
-
-      return stories[0]?.storyText || stories[0]?.text || null;
-    } catch (err) {
-      if (err.response?.status === 404) return null;
-      throw err;
+  async waitForExportJob(jobId, maxWaitSec = 300) {
+    const start = Date.now();
+    while ((Date.now() - start) / 1000 < maxWaitSec) {
+      await new Promise(r => setTimeout(r, 5000));
+      const response = await this.http.get(`/changedEntityExportJobs/${jobId}`);
+      const status = response.data?.jobStatus;
+      console.log(`  Export job status: ${status}`);
+      if (status === 'Complete') return response.data;
+      if (status === 'Error' || status === 'Cancelled') {
+        throw new Error(`Export job failed: ${response.data?.message || status}`);
+      }
     }
+    throw new Error('Export job timed out');
+  }
+
+  /**
+   * Download a CSV file from the export and parse to rows.
+   */
+  async downloadCsv(url) {
+    const response = await axios.get(url, { responseType: 'text', timeout: 60000 });
+    return this.parseCsv(response.data);
+  }
+
+  parseCsv(text) {
+    const lines = text.split(/\r?\n/).filter(l => l.trim());
+    if (lines.length === 0) return [];
+    const headers = this.splitCsvLine(lines[0]);
+    return lines.slice(1).map(line => {
+      const vals = this.splitCsvLine(line);
+      const row = {};
+      headers.forEach((h, i) => { row[h] = vals[i] || ''; });
+      return row;
+    });
+  }
+
+  splitCsvLine(line) {
+    const fields = [];
+    let cur = '', inQuote = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuote && line[i+1] === '"') { cur += '"'; i++; }
+        else inQuote = !inQuote;
+      } else if (ch === ',' && !inQuote) {
+        fields.push(cur); cur = '';
+      } else cur += ch;
+    }
+    fields.push(cur);
+    return fields;
   }
 }
 
 /**
- * Main export: fetch recent story submissions from EveryAction.
- *
- * NOTE: Because your forms use EveryAction's Story Collection feature,
- * you only need:
- *   - EVERYACTION_APP_NAME
- *   - EVERYACTION_API_KEY
- *   - EVERYACTION_DB_MODE
- *   - EVERYACTION_FORM_ACTIVIST_CODE_ID  (one per form, or comma-separated list)
- *
- * No Survey Question ID needed.
+ * Pull recent story form submissions.
  */
-async function fetchRecentStories({
-  appName,
-  apiKey,
-  dbMode,
-  activistCodeId,
-  lookbackHours,
-}) {
+async function fetchRecentStories({ appName, apiKey, dbMode, activistCodeId, lookbackHours }) {
   const client = new EveryActionClient({ appName, apiKey, dbMode });
   const sinceDate = new Date(Date.now() - lookbackHours * 60 * 60 * 1000).toISOString();
 
-  // Support comma-separated list of activist code IDs (one per form)
-  const codeIds = String(activistCodeId).split(',').map(s => s.trim()).filter(Boolean);
+  console.log(`  Creating export job for ContactsOnlineForms since ${sinceDate}...`);
 
-  const allContacts = [];
-  for (const codeId of codeIds) {
-    const contacts = await client.getContactsWithActivistCode(codeId, sinceDate);
-    allContacts.push(...contacts);
+  // Fields we want from each submission
+  const fields = ['VanID', 'FirstName', 'LastName', 'StateOrProvince', 'DateCreated', 'StoryText', 'OnlineFormName'];
+
+  const job = await client.createExportJob('ContactsOnlineForms', sinceDate, fields);
+  const jobId = job.exportJobId || job.jobId || job.id;
+  console.log(`  Export job created: ${jobId}`);
+
+  const completed = await client.waitForExportJob(jobId);
+  const files = completed.files || [];
+  console.log(`  Downloading ${files.length} file(s)...`);
+
+  const allRows = [];
+  for (const file of files) {
+    const rows = await client.downloadCsv(file.downloadUrl);
+    allRows.push(...rows);
   }
 
-  // Deduplicate by vanId (same person may have multiple codes)
-  const seen = new Set();
-  const unique = allContacts.filter(c => {
-    if (seen.has(c.vanId)) return false;
-    seen.add(c.vanId);
-    return true;
-  });
+  console.log(`  Got ${allRows.length} rows from export.`);
 
-  console.log(`  ${unique.length} unique contacts after deduplication.`);
+  // Convert rows to story objects, filter for ones with real story text
+  const stories = allRows
+    .map(row => ({
+      vanId:           row.VanID || row.vanId,
+      firstName:       row.FirstName || '',
+      lastName:        row.LastName || '',
+      stateOrProvince: row.StateOrProvince || '',
+      formName:        row.OnlineFormName || '',
+      storyText:       (row.StoryText || '').trim(),
+      submittedAt:     row.DateCreated || '',
+    }))
+    .filter(s => s.storyText.length >= 20);
 
-  // Pull story text for each contact
-  const stories = [];
-  for (const contact of unique) {
-    const storyText = await client.getStoryText(contact.vanId);
-
-    if (!storyText || storyText.trim().length < 20) continue;
-
-    stories.push({
-      vanId:           contact.vanId,
-      firstName:       contact.firstName || '',
-      lastName:        contact.lastName  || '',
-      email:           contact.emails?.[0]?.email || '',
-      stateOrProvince: contact.addresses?.[0]?.stateOrProvince || '',
-      storyText:       storyText.trim(),
-      submittedAt:     contact.dateModified || contact.dateCreated,
-    });
-  }
-
-  console.log(`  Extracted ${stories.length} stories with text.`);
+  console.log(`  ${stories.length} stories with usable text.`);
   return stories;
 }
 
