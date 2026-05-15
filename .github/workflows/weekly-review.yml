@@ -1,0 +1,67 @@
+name: Weekly Story Review
+
+on:
+  schedule:
+    - cron: '0 14 * * 5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (score stories but do not send email or deploy)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  review:
+    name: Score, build dashboard, send digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run story review pipeline
+        env:
+          EVERYACTION_APP_NAME: ${{ secrets.EVERYACTION_APP_NAME }}
+          EVERYACTION_API_KEY: ${{ secrets.EVERYACTION_API_KEY }}
+          EVERYACTION_DB_MODE: ${{ secrets.EVERYACTION_DB_MODE }}
+          EVERYACTION_FORM_ACTIVIST_CODE_ID: ${{ secrets.EVERYACTION_FORM_ACTIVIST_CODE_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          FROM_NAME: 'Coalition Story Review'
+          TO_EMAILS: ${{ secrets.TO_EMAILS }}
+          LOOKBACK_HOURS: '170'
+          MIN_SCORE_THRESHOLD: '4'
+          EXAMPLE_APPROVED_STORIES: ${{ secrets.EXAMPLE_APPROVED_STORIES }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: node index.js
+
+      - name: Deploy dashboard to GitHub Pages
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/
+          git diff --cached --quiet && echo "No dashboard changes to commit" && exit 0
+          WEEK=$(date +%Y-%m-%d)
+          git commit -m "Weekly digest: $WEEK"
+          git push
