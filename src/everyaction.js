@@ -1,11 +1,11 @@
 /**
  * EveryAction API Client
  *
- * Fetches digital action form submissions and extracts story text
- * from survey question responses.
+ * Fetches story submissions from EveryAction's Story Collection forms.
+ * These use EveryAction's dedicated Stories API — NOT survey question
+ * responses — so no Survey Question ID is needed.
  *
- * EveryAction auth: Basic auth with username = "AppName|DbMode", password = API key
- * API docs: https://docs.everyaction.com/reference
+ * Auth: Basic auth, username = "AppName|DbMode", password = API key
  */
 
 const axios = require('axios');
@@ -24,36 +24,26 @@ class EveryActionClient {
   }
 
   /**
-   * Fetch all contacts who had a specific activist code applied within
-   * the lookback window. This catches everyone who submitted the form.
-   *
-   * EveryAction applies an activist code to contacts upon form submission —
-   * find your form's activist code ID in:
-   *   Settings → Activist Codes → [your form's code]
+   * Get all contacts who had a specific activist code applied
+   * within the lookback window. Handles pagination automatically.
    */
   async getContactsWithActivistCode(activistCodeId, sinceDate) {
     const contacts = [];
     let skip = 0;
     const top = 50;
+    const since = new Date(sinceDate);
 
     console.log(`  Fetching contacts with activist code ${activistCodeId} since ${sinceDate}...`);
 
     while (true) {
       const response = await this.http.get('/people', {
-        params: {
-          $top: top,
-          $skip: skip,
-          activistCodeId,
-          // EveryAction filters by activist code presence, not application date.
-          // We filter by date in the next step using the contact's dateModified.
-        },
+        params: { $top: top, $skip: skip, activistCodeId },
       });
 
       const items = response.data?.items || [];
       if (items.length === 0) break;
 
-      // Filter to contacts created/modified since our lookback window
-      const since = new Date(sinceDate);
+      // Filter to contacts modified within our lookback window
       const recent = items.filter(c => {
         const modified = new Date(c.dateModified || c.dateCreated || 0);
         return modified >= since;
@@ -62,11 +52,12 @@ class EveryActionClient {
       contacts.push(...recent);
 
       if (items.length < top) break;
-      skip += top;
 
-      // If all items in this page are older than sinceDate, stop paginating
-      const oldestOnPage = new Date(items[items.length - 1]?.dateModified || 0);
-      if (oldestOnPage < since) break;
+      // If oldest item on this page is before our window, stop paginating
+      const oldest = new Date(items[items.length - 1]?.dateModified || 0);
+      if (oldest < since) break;
+
+      skip += top;
     }
 
     console.log(`  Found ${contacts.length} recent contacts.`);
@@ -74,50 +65,24 @@ class EveryActionClient {
   }
 
   /**
-   * Get the story text for a contact from their survey question responses.
-   * The storyQuestionId is the Survey Question ID for your "Tell us your story" field.
+   * Get story submissions for a contact using EveryAction's Stories API.
+   * This is what Story Collection Forms use — separate from survey questions.
+   * Returns the most recent story's text, or null if none found.
    */
-  async getStoryText(vanId, storyQuestionId) {
+  async getStoryText(vanId) {
     try {
-      const response = await this.http.get(`/people/${vanId}/surveyResponses`);
-      const responses = response.data || [];
+      const response = await this.http.get(`/people/${vanId}/stories`);
+      const stories = response.data?.items || response.data || [];
 
-      const storyResponse = responses.find(
-        r => r.surveyQuestionId === storyQuestionId
+      if (!stories.length) return null;
+
+      // Sort by date descending, return the most recent story's text
+      stories.sort((a, b) =>
+        new Date(b.dateModified || b.dateCreated || 0) -
+        new Date(a.dateModified || a.dateCreated || 0)
       );
 
-      // Survey responses can be structured in two ways depending on question type:
-      // 1. Free-text: storyResponse.responses[0].responses[0].mediumName (the text)
-      // 2. Or directly: storyResponse.responses[0].mediumName
-      if (!storyResponse) return null;
-
-      const inner = storyResponse.responses?.[0];
-      if (!inner) return null;
-
-      // Free-text question: text lives in mediumName or responses[0].mediumName
-      return inner.responses?.[0]?.mediumName
-        || inner.mediumName
-        || null;
-    } catch (err) {
-      // Contact may have no survey responses — not an error
-      if (err.response?.status === 404) return null;
-      throw err;
-    }
-  }
-
-  /**
-   * Alternate method: pull story from the contact's Notes (some orgs store
-   * form responses as notes rather than survey responses).
-   * Uncomment and call this instead of getStoryText if your org uses notes.
-   */
-  async getStoryFromNotes(vanId) {
-    try {
-      const response = await this.http.get(`/people/${vanId}/notes`);
-      const notes = response.data?.items || [];
-      // Return the most recent note's text
-      if (notes.length === 0) return null;
-      notes.sort((a, b) => new Date(b.dateCreated) - new Date(a.dateCreated));
-      return notes[0]?.text || null;
+      return stories[0]?.storyText || stories[0]?.text || null;
     } catch (err) {
       if (err.response?.status === 404) return null;
       throw err;
@@ -127,40 +92,60 @@ class EveryActionClient {
 
 /**
  * Main export: fetch recent story submissions from EveryAction.
- * Returns an array of { vanId, firstName, lastName, email, storyText, submittedAt }
+ *
+ * NOTE: Because your forms use EveryAction's Story Collection feature,
+ * you only need:
+ *   - EVERYACTION_APP_NAME
+ *   - EVERYACTION_API_KEY
+ *   - EVERYACTION_DB_MODE
+ *   - EVERYACTION_FORM_ACTIVIST_CODE_ID  (one per form, or comma-separated list)
+ *
+ * No Survey Question ID needed.
  */
 async function fetchRecentStories({
   appName,
   apiKey,
   dbMode,
-  storyQuestionId,
   activistCodeId,
   lookbackHours,
 }) {
   const client = new EveryActionClient({ appName, apiKey, dbMode });
-
   const sinceDate = new Date(Date.now() - lookbackHours * 60 * 60 * 1000).toISOString();
 
-  const contacts = await client.getContactsWithActivistCode(activistCodeId, sinceDate);
+  // Support comma-separated list of activist code IDs (one per form)
+  const codeIds = String(activistCodeId).split(',').map(s => s.trim()).filter(Boolean);
 
+  const allContacts = [];
+  for (const codeId of codeIds) {
+    const contacts = await client.getContactsWithActivistCode(codeId, sinceDate);
+    allContacts.push(...contacts);
+  }
+
+  // Deduplicate by vanId (same person may have multiple codes)
+  const seen = new Set();
+  const unique = allContacts.filter(c => {
+    if (seen.has(c.vanId)) return false;
+    seen.add(c.vanId);
+    return true;
+  });
+
+  console.log(`  ${unique.length} unique contacts after deduplication.`);
+
+  // Pull story text for each contact
   const stories = [];
+  for (const contact of unique) {
+    const storyText = await client.getStoryText(contact.vanId);
 
-  for (const contact of contacts) {
-    const storyText = await client.getStoryText(contact.vanId, storyQuestionId);
-
-    if (!storyText || storyText.trim().length < 20) {
-      // Skip empty or near-empty submissions
-      continue;
-    }
+    if (!storyText || storyText.trim().length < 20) continue;
 
     stories.push({
-      vanId: contact.vanId,
-      firstName: contact.firstName || '',
-      lastName: contact.lastName || '',
-      email: contact.emails?.[0]?.email || '',
+      vanId:           contact.vanId,
+      firstName:       contact.firstName || '',
+      lastName:        contact.lastName  || '',
+      email:           contact.emails?.[0]?.email || '',
       stateOrProvince: contact.addresses?.[0]?.stateOrProvince || '',
-      storyText: storyText.trim(),
-      submittedAt: contact.dateModified || contact.dateCreated,
+      storyText:       storyText.trim(),
+      submittedAt:     contact.dateModified || contact.dateCreated,
     });
   }
 
